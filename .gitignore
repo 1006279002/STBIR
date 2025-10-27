@@ -5,3 +5,7 @@
 .DS_Store
 data
 __pycache__/
+
+setup.md
+
+nohup.out
