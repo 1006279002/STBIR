@@ -1,0 +1,26 @@
+model:
+  learning_rate: 1e-5
+  batch_size: 32
+  model_name: 'ViT-B/16'
+  optimizer: 'adam'
+  weight_decay: 1e-4
+  scheduler: 'LR'
+  scheduler_step_size: 10
+  scheduler_gamma: 0.1
+  dropout_rate: 0.5
+
+data:
+  dataset_path: "/home/gaohanchen/SBIR/CSTBIR/data/dataset/CSTBIR_dataset.json"
+  # dataset_path: "/home/gaohanchen/SBIR/CSTBIR/data/dataset/dataset.json"
+  images_path: "/home/gaohanchen/SBIR/CSTBIR/data/images/VG_Dataset"
+  # sketch_embeddings_path: "/home/gaohanchen/SBIR/CSTBIR/data/sketch_embeds/sketch_embeddings.pt"
+  train_split_name: 'train'
+  val_split_name: 'val_large'
+  batch_shuffle: True
+  num_workers: 4
+  pin_memory: True
+
+training:
+  gpu: True
+  save_model_path: "/home/gaohanchen/SBIR/CSTBIR/data/model"
+  epochs: 15
