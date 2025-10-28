@@ -204,11 +204,11 @@ class Transformer(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int, input_channels: int = 3):
         super().__init__()
         self.input_resolution = input_resolution
         self.output_dim = output_dim
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.conv1 = nn.Conv2d(in_channels=input_channels, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
@@ -220,7 +220,7 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor):
+    def _forward_features(self, x: torch.Tensor):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -232,12 +232,32 @@ class VisionTransformer(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
-        x = self.ln_post(x[:, 0, :])
-
-        if self.proj is not None:
-            x = x @ self.proj
-
+        x = self.ln_post(x)
         return x
+
+    def forward(self, x: torch.Tensor, return_full_sequence: bool = False):
+        x = self._forward_features(x)
+
+        cls_token = x[:, 0, :]
+        if self.proj is not None:
+            cls_proj = cls_token @ self.proj
+        else:
+            cls_proj = cls_token
+
+        if return_full_sequence:
+            return cls_proj, x
+
+        return cls_proj
+
+    def forward_with_patches(self, x: torch.Tensor):
+        sequence = self._forward_features(x)
+        cls_token = sequence[:, 0, :]
+        patch_tokens = sequence[:, 1:, :]
+        if self.proj is not None:
+            cls_proj = cls_token @ self.proj
+        else:
+            cls_proj = cls_token
+        return cls_proj, cls_token, patch_tokens, sequence
 
 
 class CLIP(nn.Module):
@@ -276,7 +296,8 @@ class CLIP(nn.Module):
                 width=vision_width,
                 layers=vision_layers,
                 heads=vision_heads,
-                output_dim=embed_dim
+                output_dim=embed_dim,
+                input_channels=3
             )
 
         self.transformer = Transformer(
