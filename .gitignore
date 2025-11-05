@@ -4,6 +4,7 @@
 !requirements.txt
 .DS_Store
 data
+datasets
 __pycache__/
 
 setup.md
