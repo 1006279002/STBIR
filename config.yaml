@@ -1,40 +1,82 @@
-model:
-  learning_rate: 1e-5
-  batch_size: 32
-  model_name: 'ViT-B/16'
-  optimizer: 'adam'
-  weight_decay: 1e-4
-  scheduler: 'LR'
-  scheduler_step_size: 10
-  scheduler_gamma: 0.1
-  dropout_rate: 0.5
+seed: 110
 
 data:
-  # dataset_path: "/home/gaohanchen/SBIR/CSTBIR/data/dataset/CSTBIR_dataset.json"
-  dataset_path: "/home/gaohanchen/SBIR/CSTBIR/data/dataset/dataset.json"
-  images_path: "/home/gaohanchen/SBIR/CSTBIR/data/images/VG_Dataset"
-  sketch_path: "/home/gaohanchen/SBIR/CSTBIR/data/sketch/ndjson"
-  train_split_name: 'train'
-  val_split_name: 'val_large'
-  batch_shuffle: True
-  num_workers: 4
-  pin_memory: True
-  prefetch_batches: 4
+  val_ratio: 0.1
+  image_size: 256
+  negatives_per_modality:
+    sketch: 6
+    image: 6
+    text: 6
+  manifests:
+    train: manifests/train_manifest.jsonl
+    val: manifests/val_manifest.jsonl
+    test: manifests/test_manifest.jsonl
+  datasets:
+    chair:
+      train:
+        text: datasets/chair_train.txt
+        image_dir: datasets/datasets/ChairV2/trainB
+        sketch_dir: datasets/datasets/ChairV2/trainA
+        noise_dir: datasets/datasets/ChairV2/train_noise
+      test:
+        text: datasets/chair_test.txt
+        image_dir: datasets/datasets/ChairV2/testB
+        sketch_dir: datasets/datasets/ChairV2/testA
+        noise_dir: datasets/datasets/ChairV2/test_noise
+    shoe:
+      train:
+        text: datasets/shoe_train.txt
+        image_dir: datasets/datasets/ShoeV2/trainB
+        sketch_dir: datasets/datasets/ShoeV2/trainA
+        noise_dir: datasets/datasets/ShoeV2/train_noise
+      test:
+        text: datasets/shoe_test.txt
+        image_dir: datasets/datasets/ShoeV2/testB
+        sketch_dir: datasets/datasets/ShoeV2/testA
+        noise_dir: datasets/datasets/ShoeV2/test_noise
+
+model:
+  clip_model: ViT-B/32
+  sketch_backbone: resnet50
+  sketch_pretrained: true
+  feature_dim: 512
+  fusion_strategy: mean
 
 training:
-  gpu: True
-  save_model_path: "/home/gaohanchen/SBIR/CSTBIR/data/model"
-  epochs: 15
+  batch_size: 10
+  num_workers: 4
+  device: cuda
+  gradient_clip: 1.0
+  checkpoint:
+    dir: checkpoints
+    keep_last: 3
+    monitor: val/loss
+  stages:
+    - name: sketch_alignment
+      target: sketch
+      epochs: 10
+      lr: 5.0e-5
+      weight_decay: 1.0e-4
+    - name: image_alignment
+      target: image
+      epochs: 30
+      lr: 5.0e-5
+      weight_decay: 1.0e-4
+    - name: text_alignment
+      target: text
+      epochs: 12
+      lr: 5.0e-5
+      weight_decay: 1.0e-4
 
 loss:
-  contrastive_weight: 1.0
-  text_cls_weight: 1.0
-  image_cls_weight: 1.0
-  detection_weight: 1.0
-  reconstruction_weight: 1.0
-  sr_bce_weight: 0.7
-  sr_dice_weight: 0.3
+  temperature: 0.07
+  triplet_margin: 0.2
+  fusion_margin: 0.1
+  weights:
+    info_nce: 1.0
+    triplet: 0.7
+    fusion: 0.3
 
-detector:
-  grid_size: 7
-  boxes_per_cell: 2
+retrieval:
+  top_k: 10
+  results_dir: outputs/retrieval

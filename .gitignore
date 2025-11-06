@@ -6,6 +6,8 @@
 data
 datasets
 __pycache__/
+checkpoints
+outputs
 
 setup.md
 

@@ -1,246 +1,226 @@
-import json
-import os
-from collections import OrderedDict, defaultdict
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from __future__ import annotations
 
-import numpy as np
-import pandas as pd
+import json
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence
+
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image
+from torch.utils.data import Dataset
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 from src import clip
 
-class CSTBIR_dataset:
-    """支持文本、图像与素描三模态的数据管线。"""
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
-    _offset_cache: Dict[str, Dict[int, int]] = {}
-    _label_to_idx: Dict[str, int] = {}
-    _idx_to_label: List[str] = []
-    _sketch_root: Optional[str] = None
 
-    def __init__(self, data_path: str, image_files_path: str, sketch_files_path: str, batch_size: int, split: str, preprocess):
-        self.batch_size = batch_size
-        self.preprocess = preprocess
-        self.image_root = image_files_path
-        self.sketch_root = sketch_files_path
+@dataclass
+class ManifestEntry:
+    """In-memory representation of a manifest row."""
 
-        full_df = pd.read_json(data_path, lines=False)
-        full_df = full_df.dropna(subset=["label", "sketch", "image", "text", "split"])
+    idx: int
+    id: str
+    category: str
+    image_path: Path
+    text: str
+    positive_sketches: List[Path]
+    negative_sketches: List[Path]
+    negative_images: List[Path]
+    negative_texts: List[str]
 
-        if not CSTBIR_dataset._label_to_idx:
-            labels = sorted(full_df["label"].unique())
-            CSTBIR_dataset._label_to_idx = {label: idx for idx, label in enumerate(labels)}
-            CSTBIR_dataset._idx_to_label = labels
 
-        self.data = full_df[full_df["split"] == split].reset_index(drop=True)
-        if self.data.empty:
-            raise RuntimeError(f"未找到 split={split} 的数据样本。")
+def default_sketch_transform(image_size: int) -> transforms.Compose:
+    return transforms.Compose(
+        [
+            transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(image_size),
+            transforms.Grayscale(num_output_channels=3),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
 
-        self.records: List[Dict[str, object]] = []
-        label_sketch_indices: Dict[str, set] = defaultdict(set)
 
-        self._register_sketch_root()
-
-        for row in self.data.itertuples(index=False):
-            label = getattr(row, "label")
-            sketch_name = getattr(row, "sketch")
-            sketch_label, sketch_idx = self._parse_sketch_name(sketch_name)
-            label_id = CSTBIR_dataset._label_to_idx[label]
-
-            record = {
-                "image_path": os.path.join(self.image_root, getattr(row, "image")),
-                "text": getattr(row, "text"),
-                "label": label,
-                "label_id": label_id,
-                "sketch_label": sketch_label,
-                "sketch_idx": sketch_idx,
-            }
-            self.records.append(record)
-            label_sketch_indices[sketch_label].add(sketch_idx)
-
-        self.n_samples = len(self.records)
-        self._build_conflict_maps()
-
-        for sketch_label, indices in label_sketch_indices.items():
-            self._ensure_offsets(sketch_label, indices)
-
-        self._sketch_cache: "OrderedDict[Tuple[str, int], torch.Tensor]" = OrderedDict()
-        self._sketch_cache_limit = 2048
-        self._image_cache: "OrderedDict[str, torch.Tensor]" = OrderedDict()
-        self._image_cache_limit = 2048
-        self._text_cache: Dict[str, torch.Tensor] = {}
-
-    @staticmethod
-    def label_to_id(label: str) -> int:
-        return CSTBIR_dataset._label_to_idx[label]
-
-    @staticmethod
-    def id_to_label(idx: int) -> str:
-        return CSTBIR_dataset._idx_to_label[idx]
-
-    def _build_conflict_maps(self):
-        self.image2sampleidx: Dict[str, List[int]] = defaultdict(list)
-        self.text2image: Dict[str, List[str]] = defaultdict(list)
-        self.image2text: Dict[str, List[str]] = defaultdict(list)
-
-        for idx, record in enumerate(self.records):
-            image_path = record["image_path"]
-            text = record["text"]
-            self.image2sampleidx[image_path].append(idx)
-            self.image2text[image_path].append(text)
-            self.text2image[text].append(image_path)
-
-    def __len__(self):
-        return max(1, self.n_samples // self.batch_size)
-
-    def __getitem__(self, idx: int):
-        record = self.records[idx]
-        image = self._get_image_tensor(record["image_path"])
-        text = self._get_text_tokens(record["text"])
-        sketch = self._get_sketch_tensor(record["sketch_label"], record["sketch_idx"])  # (1, 224, 224)
-        label_id = record["label_id"]
-        return image, text, sketch, label_id
-
-    def is_text_conflict(self, text: str, images: List[str]) -> bool:
-        return bool(set(self.text2image[text]) & set(images))
-
-    def is_image_conflict(self, image: str, texts: List[str]) -> bool:
-        return bool(set(self.image2text[image]) & set(texts))
-
-    def get_samples(self) -> Dict[str, torch.Tensor]:
-        selected_images: List[str] = []
-        selected_texts: List[str] = []
-        batch_images: List[torch.Tensor] = []
-        batch_texts: List[torch.Tensor] = []
-        batch_sketches: List[torch.Tensor] = []
-        batch_labels: List[int] = []
-
-        while len(selected_images) < self.batch_size:
-            sample_idx = np.random.randint(0, self.n_samples)
-            record = self.records[sample_idx]
-            image_path = record["image_path"]
-            text = record["text"]
-
-            if image_path in selected_images or text in selected_texts:
+def load_manifest(path: Path) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
                 continue
-            if self.is_text_conflict(text, selected_images):
-                continue
-            if self.is_image_conflict(image_path, selected_texts):
-                continue
+            rows.append(json.loads(line))
+    return rows
 
-            selected_images.append(image_path)
-            selected_texts.append(text)
 
-            batch_images.append(self._get_image_tensor(image_path))
-            batch_texts.append(self._get_text_tokens(text))
-            batch_sketches.append(self._get_sketch_tensor(record["sketch_label"], record["sketch_idx"]))
-            batch_labels.append(record["label_id"])
+class SBIRDataset(Dataset):
+    """Dataset that yields positive/negative triplets for each modality."""
 
-        images_tensor = torch.stack(batch_images, dim=0)
-        texts_tensor = torch.stack(batch_texts, dim=0)
-        sketches_tensor = torch.stack(batch_sketches, dim=0)
-        labels_tensor = torch.tensor(batch_labels, dtype=torch.long)
+    def __init__(
+        self,
+        manifest_path: Path,
+        clip_preprocess,
+        sketch_transform: Optional[transforms.Compose] = None,
+        negatives_per_modality: Optional[Dict[str, int]] = None,
+        clip_context_length: int = 77,
+    ):
+        self.manifest_path = Path(manifest_path)
+        self.clip_preprocess = clip_preprocess
+        self.sketch_transform = sketch_transform or default_sketch_transform(224)
+        self.neg_counts = negatives_per_modality or {"sketch": 4, "image": 4, "text": 4}
+        self.context_length = clip_context_length
+
+        manifest_rows = load_manifest(self.manifest_path)
+        self.entries: List[ManifestEntry] = []
+        for idx, row in enumerate(manifest_rows):
+            entry = ManifestEntry(
+                idx=idx,
+                id=row["id"],
+                category=row.get("category", "unknown"),
+                image_path=Path(row["image"]).resolve(),
+                text=row["text"],
+                positive_sketches=[Path(p).resolve() for p in row.get("positive_sketches", [])],
+                negative_sketches=[Path(p).resolve() for p in row.get("negative_sketches", [])],
+                negative_images=[Path(p).resolve() for p in row.get("negative_images", [])],
+                negative_texts=list(row.get("negative_texts", [])),
+            )
+            if not entry.positive_sketches:
+                raise ValueError(f"entry {entry.id} missing positive sketches")
+            self.entries.append(entry)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        entry = self.entries[index]
+        image_tensor = self._load_image(entry.image_path)
+        text_tokens = self._tokenize(entry.text)
+
+        sketch_path = random.choice(entry.positive_sketches)
+        sketch_resnet = self._load_sketch(sketch_path, to_clip=False)
+        sketch_clip = self._load_sketch(sketch_path, to_clip=True)
+
+        neg_sketch_paths = self._sample(entry.negative_sketches, self.neg_counts.get("sketch", 0))
+        neg_image_paths = self._sample(entry.negative_images, self.neg_counts.get("image", 0))
+        neg_text_values = self._sample(entry.negative_texts, self.neg_counts.get("text", 0))
+
+        neg_sketch_resnet = self._load_sketch_batch(neg_sketch_paths, to_clip=False, like=sketch_resnet)
+        neg_sketch_clip = self._load_sketch_batch(neg_sketch_paths, to_clip=True, like=sketch_clip)
+        neg_image_tensor = self._load_image_batch(neg_image_paths, like=image_tensor)
+        neg_text_tokens = self._tokenize_batch(neg_text_values)
 
         return {
-            "images": images_tensor,
-            "texts": texts_tensor,
-            "sketches": sketches_tensor,
-            "labels": labels_tensor,
+            "image": image_tensor,
+            "text_tokens": text_tokens,
+            "sketch_resnet": sketch_resnet,
+            "sketch_clip": sketch_clip,
+            "neg_images": neg_image_tensor,
+            "neg_text_tokens": neg_text_tokens,
+            "neg_sketches_resnet": neg_sketch_resnet,
+            "neg_sketches_clip": neg_sketch_clip,
+            "meta": {
+                "id": entry.id,
+                "category": entry.category,
+                "image_path": str(entry.image_path),
+                "sketch_path": str(sketch_path),
+                "negative_image_paths": [str(p) for p in neg_image_paths],
+                "negative_sketch_paths": [str(p) for p in neg_sketch_paths],
+                "negative_texts": neg_text_values,
+                "text": entry.text,
+            },
         }
 
-    @staticmethod
-    def _parse_sketch_name(name: str) -> Tuple[str, int]:
-        stem = Path(name).stem
-        if "_" not in stem:
-            raise ValueError(f"无法解析素描文件名: {name}")
-        label, index = stem.split("_", 1)
-        return label, int(index)
+    # ------------------------------------------------------------------
+    # loading helpers
+    # ------------------------------------------------------------------
+    def _load_image(self, path: Path) -> torch.Tensor:
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            return self.clip_preprocess(img)
 
-    @classmethod
-    def _ensure_offsets(cls, label: str, indices: set):
-        cache = cls._offset_cache.setdefault(label, {})
-        missing = set(indices) - set(cache.keys())
-        if not missing:
-            return
+    def _load_image_batch(self, paths: Sequence[Path], like: torch.Tensor) -> torch.Tensor:
+        if not paths:
+            return like.new_zeros((0,) + like.shape)
+        tensors = [self._load_image(p) for p in paths]
+        return torch.stack(tensors, dim=0)
 
-        if cls._sketch_root is None:
-            raise RuntimeError("请先设置素描根目录。")
-        ndjson_path = Path(cls._sketch_root) / f"{label}.ndjson"
-        if not ndjson_path.exists():
-            raise FileNotFoundError(f"未找到素描 ndjson 文件: {ndjson_path}")
+    def _load_sketch(self, path: Path, to_clip: bool) -> torch.Tensor:
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            if to_clip:
+                return self.clip_preprocess(img)
+            return self.sketch_transform(img)
 
-        with ndjson_path.open("rb") as reader:
-            offset = reader.tell()
-            for line_idx, _ in enumerate(reader):
-                if line_idx in missing:
-                    cache[line_idx] = offset
-                    if len(cache) == len(indices):
-                        break
-                offset = reader.tell()
+    def _load_sketch_batch(self, paths: Sequence[Path], to_clip: bool, like: torch.Tensor) -> torch.Tensor:
+        if not paths:
+            return like.new_zeros((0,) + like.shape)
+        tensors = [self._load_sketch(p, to_clip=to_clip) for p in paths]
+        return torch.stack(tensors, dim=0)
 
-    def _register_sketch_root(self):
-        if CSTBIR_dataset._sketch_root is None:
-            CSTBIR_dataset._sketch_root = self.sketch_root
+    def _tokenize(self, text: str) -> torch.Tensor:
+        return clip.tokenize([text], context_length=self.context_length, truncate=True).squeeze(0)
 
-    def _get_sketch_tensor(self, label: str, index: int) -> torch.Tensor:
-        key = (label, index)
-        cached = self._sketch_cache.get(key)
-        if cached is not None:
-            self._sketch_cache.move_to_end(key)
-            return cached.clone()
-
-        offset = self._offset_cache[label][index]
-        ndjson_path = Path(self.sketch_root) / f"{label}.ndjson"
-        with ndjson_path.open("rb") as reader:
-            reader.seek(offset)
-            line = reader.readline().decode("utf-8").strip()
-        record = json.loads(line)
-        drawing = record["drawing"]
-        tensor = self._drawing_to_tensor(drawing)
-
-        self._sketch_cache[key] = tensor
-        if len(self._sketch_cache) > self._sketch_cache_limit:
-            self._sketch_cache.popitem(last=False)
-        return tensor.clone()
+    def _tokenize_batch(self, texts: Sequence[str]) -> torch.Tensor:
+        if not texts:
+            return torch.zeros((0, self.context_length), dtype=torch.long)
+        tokens = clip.tokenize(list(texts), context_length=self.context_length, truncate=True)
+        return tokens
 
     @staticmethod
-    def _drawing_to_tensor(drawing: List[List[List[int]]], size: int = 224, line_width: int = 3) -> torch.Tensor:
-        image = Image.new("L", (size, size), 0)
-        draw = ImageDraw.Draw(image)
-        scale = (size - 1) / 255.0
-
-        for stroke_x, stroke_y in drawing:
-            if not stroke_x or not stroke_y:
-                continue
-            points = [(x * scale, y * scale) for x, y in zip(stroke_x, stroke_y)]
-            if len(points) == 1:
-                draw.point(points[0], fill=255)
-            else:
-                draw.line(points, fill=255, width=line_width, joint="curve")
-
-        array = np.array(image, dtype=np.float32) / 255.0
-        tensor = torch.from_numpy(array).unsqueeze(0).contiguous()
-        return tensor
-
-    def _get_image_tensor(self, image_path: str) -> torch.Tensor:
-        cached = self._image_cache.get(image_path)
-        if cached is not None:
-            self._image_cache.move_to_end(image_path)
-            return cached.clone()
-
-        tensor = self.preprocess(Image.open(image_path))
-        self._image_cache[image_path] = tensor
-        if len(self._image_cache) > self._image_cache_limit:
-            self._image_cache.popitem(last=False)
-        return tensor.clone()
-
-    def _get_text_tokens(self, text: str) -> torch.Tensor:
-        cached = self._text_cache.get(text)
-        if cached is None:
-            cached = clip.tokenize(text).squeeze(0)
-            self._text_cache[text] = cached
-        return cached.clone()
+    def _sample(sequence: Sequence, count: int) -> List:
+        if count <= 0 or not sequence:
+            return []
+        if len(sequence) >= count:
+            return random.sample(list(sequence), count)
+        return [random.choice(list(sequence)) for _ in range(count)]
 
 
-__all__ = ["CSTBIR_dataset"]
+def sbir_collate(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    images = torch.stack([item["image"] for item in batch], dim=0)
+    texts = torch.stack([item["text_tokens"] for item in batch], dim=0)
+    sketches_resnet = torch.stack([item["sketch_resnet"] for item in batch], dim=0)
+    sketches_clip = torch.stack([item["sketch_clip"] for item in batch], dim=0)
+
+    neg_images = _pad_and_stack(batch, key="neg_images", like=images)
+    neg_texts = _pad_and_stack(batch, key="neg_text_tokens", like=texts)
+    neg_sketch_resnet = _pad_and_stack(batch, key="neg_sketches_resnet", like=sketches_resnet)
+    neg_sketch_clip = _pad_and_stack(batch, key="neg_sketches_clip", like=sketches_clip)
+
+    meta = [item["meta"] for item in batch]
+
+    return {
+        "images": images,
+        "texts": texts,
+        "sketches_resnet": sketches_resnet,
+        "sketches_clip": sketches_clip,
+        "neg_images": neg_images,
+        "neg_texts": neg_texts,
+        "neg_sketches_resnet": neg_sketch_resnet,
+        "neg_sketches_clip": neg_sketch_clip,
+        "meta": meta,
+    }
+
+
+def _pad_and_stack(batch: List[Dict[str, torch.Tensor]], key: str, like: torch.Tensor) -> torch.Tensor:
+    tensors = [item[key] for item in batch]
+    if not tensors:
+        return like.new_zeros((0,))
+    max_len = max(t.size(0) for t in tensors)
+    if max_len == 0:
+        return like.new_zeros((len(batch), 0) + like.shape[1:])
+
+    padded = []
+    for tensor in tensors:
+        if tensor.size(0) == max_len:
+            padded.append(tensor)
+            continue
+        pad_shape = (max_len - tensor.size(0),) + tensor.size()[1:]
+        pad_tensor = tensor.new_zeros(pad_shape)
+        padded.append(torch.cat([tensor, pad_tensor], dim=0))
+    return torch.stack(padded, dim=0)
+
+
+__all__ = ["SBIRDataset", "sbir_collate", "default_sketch_transform", "load_manifest"]
