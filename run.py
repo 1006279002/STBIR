@@ -145,8 +145,6 @@ def main() -> None:
                 f"val {val_stats['loss']:.4f}"
             )
 
-            ## refresh manifest after each epoch
-            # generate_manifest_main()
 
 
 def run_epoch(
@@ -195,7 +193,6 @@ def run_epoch(
 
 
 if __name__ == "__main__":
-    generate_manifest_main()
     main()
     retrieve_main()
 
