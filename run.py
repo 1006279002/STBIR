@@ -43,16 +43,23 @@ def main() -> None:
 
     dataset_cfg = config["data"]
     manifests = dataset_cfg["manifests"]
+    curriculum_noise_cfg = dataset_cfg.get("curriculum_noise")
 
     train_dataset = SBIRDataset(
         Path(manifests["train"]),
         clip_preprocess=preprocess,
         negatives_per_modality=dataset_cfg.get("negatives_per_modality"),
+        curriculum_noise=curriculum_noise_cfg,
+        apply_noise=True,
     )
     val_dataset = SBIRDataset(
         Path(manifests["val"]),
         clip_preprocess=preprocess,
         negatives_per_modality=dataset_cfg.get("negatives_per_modality"),
+        category_mapping=train_dataset.category_to_index,
+        virtual_mapping=train_dataset.virtual_class_to_index,
+        curriculum_noise=curriculum_noise_cfg,
+        apply_noise=False,
     )
 
     train_loader = DataLoader(
@@ -73,12 +80,14 @@ def main() -> None:
     )
 
     model_cfg = config["model"]
+    num_classes = train_dataset.num_virtual_classes or train_dataset.num_categories
     model = MultiStageSBIRModel(
         clip_model=clip_model,
         feature_dim=model_cfg.get("feature_dim", 512),
         sketch_backbone=model_cfg.get("sketch_backbone", "resnet50"),
         sketch_pretrained=model_cfg.get("sketch_pretrained", True),
         fusion_strategy=model_cfg.get("fusion_strategy", "mean"),
+        num_classes=num_classes,
     ).to(device)
 
     if args.resume:
@@ -94,6 +103,7 @@ def main() -> None:
         weight_info_nce=float(weight_cfg["info_nce"]),
         weight_triplet=float(weight_cfg["triplet"]),
         weight_fusion=float(weight_cfg["fusion"]),
+        weight_cls=float(weight_cfg.get("cls", 0.0)),
     )
 
     stages = config["training"]["stages"]
@@ -122,6 +132,13 @@ def main() -> None:
         stage_best = float("inf")
 
         for epoch in range(epochs):
+            train_dataset.update_noise(epoch=epoch, total_epochs=epochs, stage=target)
+            noise_state = train_dataset.noise_parameters()
+            if noise_state is not None:
+                prob, strength = noise_state
+                print(
+                    f"Noise schedule | stage {target} epoch {epoch}: prob={prob:.3f} strength={strength:.3f}"
+                )
             train_stats = run_epoch(model, train_loader, optimizer, device, loss_cfg, target, train=True)
             val_stats = run_epoch(model, val_loader, optimizer, device, loss_cfg, target, train=False)
 
@@ -140,13 +157,13 @@ def main() -> None:
             if is_best:
                 save_checkpoint(checkpoint, ckpt_dir / "best.pt")
 
+            train_cls = train_stats.get("cls", 0.0)
+            val_cls = val_stats.get("cls", 0.0)
             print(
-                f"Stage {target}, epoch {epoch}: train {train_stats['loss']:.4f}, "
-                f"val {val_stats['loss']:.4f}"
+                f"Stage {target}, epoch {epoch}: train {train_stats['loss']:.4f} "
+                f"(cls {train_cls:.4f}) val {val_stats['loss']:.4f} (cls {val_cls:.4f})"
             )
 
-            ## refresh manifest after each epoch
-            # generate_manifest_main()
 
 
 def run_epoch(
@@ -164,6 +181,7 @@ def run_epoch(
         "info_nce": AverageMeter(),
         "triplet": AverageMeter(),
         "fusion": AverageMeter(),
+        "cls": AverageMeter(),
     }
 
     for batch in tqdm(loader, desc="train" if train else "eval", leave=False):
@@ -190,12 +208,17 @@ def run_epoch(
         meter["info_nce"].update(outputs["info_nce"].item(), batch_size)
         meter["triplet"].update(outputs["triplet"].item(), batch_size)
         meter["fusion"].update(outputs["fusion"].item(), batch_size)
+        cls_value = outputs.get("cls")
+        if cls_value is None:
+            cls_item = 0.0
+        else:
+            cls_item = cls_value.item()
+        meter["cls"].update(cls_item, batch_size)
 
     return {key: value.avg for key, value in meter.items()}
 
 
 if __name__ == "__main__":
-    generate_manifest_main()
     main()
     retrieve_main()
 

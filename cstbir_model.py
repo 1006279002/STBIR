@@ -27,6 +27,7 @@ class LossConfig:
     weight_info_nce: float
     weight_triplet: float
     weight_fusion: float
+    weight_cls: float
 
 
 class SketchEncoder(nn.Module):
@@ -60,15 +61,23 @@ class MultiStageSBIRModel(nn.Module):
         sketch_backbone: str = "resnet50",
         sketch_pretrained: bool = True,
         fusion_strategy: str = "mean",
+        num_classes: int = 0,
     ):
         super().__init__()
         self.clip = clip_model
         self.feature_dim = feature_dim
         self.sketch_encoder = SketchEncoder(sketch_backbone, output_dim=feature_dim, pretrained=sketch_pretrained)
         self.fusion_strategy = fusion_strategy
+        self.num_classes = num_classes
 
         self.register_buffer("clip_mean", CLIP_MEAN.view(1, 3, 1, 1))
         self.register_buffer("clip_std", CLIP_STD.view(1, 3, 1, 1))
+
+        self.cls_head = None
+        if num_classes > 0:
+            self.cls_head = nn.Linear(feature_dim, num_classes)
+            nn.init.normal_(self.cls_head.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.cls_head.bias)
 
     # ------------------------------------------------------------------
     # Stage control
@@ -104,6 +113,10 @@ class MultiStageSBIRModel(nn.Module):
                 self.clip.text_projection.requires_grad_(True)
         else:
             raise ValueError(f"Unknown training target: {target}")
+
+        if self.cls_head is not None:
+            self.cls_head.train()
+            self.cls_head.requires_grad_(True)
 
     # ------------------------------------------------------------------
     # Encoding helpers
@@ -172,10 +185,33 @@ class MultiStageSBIRModel(nn.Module):
         info = self._info_nce(anchor, positives, negatives, mask, loss_cfg.temperature)
         triplet = self._triplet_cosine(anchor, positives, negatives, mask, loss_cfg.triplet_margin)
 
+        cls_loss = positives.new_tensor(0.0)
+        if self.cls_head is not None and loss_cfg.weight_cls > 0.0:
+            cls_targets = batch.get("virtual_class_ids")
+            mask_cls = None
+            if cls_targets is not None:
+                mask_cls = cls_targets >= 0
+                if not mask_cls.any():
+                    cls_targets = None
+                    mask_cls = None
+            if cls_targets is None:
+                cls_targets = batch.get("category_ids")
+                if cls_targets is not None:
+                    mask_cls = cls_targets >= 0
+                    if not mask_cls.any():
+                        cls_targets = None
+                        mask_cls = None
+            if cls_targets is not None and mask_cls is not None and mask_cls.any():
+                logits = self.cls_head(positives[mask_cls])
+                cls_loss = F.cross_entropy(logits, cls_targets[mask_cls])
+            else:
+                cls_loss = positives.new_tensor(0.0)
+
         total = (
             loss_cfg.weight_info_nce * info
             + loss_cfg.weight_triplet * triplet
             + loss_cfg.weight_fusion * fusion_loss
+            + loss_cfg.weight_cls * cls_loss
         )
 
         return {
@@ -183,6 +219,7 @@ class MultiStageSBIRModel(nn.Module):
             "info_nce": info,
             "triplet": triplet,
             "fusion": fusion_loss,
+            "cls": cls_loss,
             "features": {
                 "image": image_features,
                 "text": text_features,

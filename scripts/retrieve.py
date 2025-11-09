@@ -127,16 +127,27 @@ def main() -> None:
 
     clip_model, preprocess = clip.load(config["model"]["clip_model"], device=device, jit=False)
     model_cfg = config["model"]
+
+    checkpoint_path = Path(args.checkpoint)
+    state = torch.load(checkpoint_path, map_location=device)
+    saved_model_state = state.get("model", {})
+    saved_classifier = saved_model_state.get("cls_head.weight")
+    num_classes = saved_classifier.size(0) if saved_classifier is not None else 0
+
     model = MultiStageSBIRModel(
         clip_model=clip_model,
         feature_dim=model_cfg.get("feature_dim", 512),
         sketch_backbone=model_cfg.get("sketch_backbone", "resnet50"),
         sketch_pretrained=model_cfg.get("sketch_pretrained", True),
         fusion_strategy=model_cfg.get("fusion_strategy", "mean"),
+        num_classes=num_classes,
     ).to(device)
 
-    state = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(state["model"])
+    incompatible = model.load_state_dict(saved_model_state, strict=False)
+    if incompatible.missing_keys:
+        print(f"warning: missing keys when loading checkpoint: {incompatible.missing_keys}")
+    if incompatible.unexpected_keys:
+        print(f"warning: unexpected keys ignored from checkpoint: {incompatible.unexpected_keys}")
     model.eval()
 
     manifest_path = Path(config["data"]["manifests"]["test"])
