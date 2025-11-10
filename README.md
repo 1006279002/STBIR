@@ -23,7 +23,7 @@
 ## 环境配置
 - Python >= 3.8.16（推荐 Conda）
 - PyTorch 1.13.1 + CUDA 11.6（或根据显卡调整）
-- 依赖见 `environment.yaml` 与 `requirements.txt`
+- 依赖见 `environment.yaml` 
 
 快速安装：
 ```bash
@@ -95,3 +95,11 @@ python -m scripts.retrieve --config config.yaml --checkpoint checkpoints/best.pt
 - `scripts/generate_manifest.py`：根据原始数据构建带负样本的 manifest。
 - `scripts/retrieve.py`：检索评估脚本。
 - `utils.py`：通用工具（配置读取、CUDA 预取、平均计数器等）。
+
+**关键表示与公式**
+
+- 归一化特征：$\hat{s} = \mathrm{normalize}(f_s)$，$\hat{i} = \mathrm{normalize}(f_i)$，$\hat{t} = \mathrm{normalize}(f_t)$。
+- 阶段锚点：$a_s = \mathrm{normalize}(\hat{i} + \hat{t})$，$a_i = \mathrm{normalize}(\hat{t} + \hat{s})$，$a_t = \mathrm{normalize}(\hat{i} + \hat{s})$。
+- InfoNCE：$\mathcal{L}_{\text{InfoNCE}} = - \log \dfrac{\exp(a \cdot p / \tau)}{\exp(a \cdot p / \tau) + \sum_j \exp(a \cdot n_j / \tau)}$。
+- 余弦三元组：$\mathcal{L}_{\text{Triplet}} = \max(0, m + a \cdot n_j - a \cdot p)$。
+- ArcFace 分类：$\mathcal{L}_{\text{ArcFace}} = - \log \dfrac{e^{s(\cos(\theta_y + m))}}{e^{s(\cos(\theta_y + m))} + \sum_{k \neq y} e^{s \cos \theta_k}}$。
