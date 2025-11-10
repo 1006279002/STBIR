@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable
 
 import torch
 from torch.utils.data import DataLoader
@@ -13,7 +13,7 @@ from tqdm import tqdm
 from cstbir_model import LossConfig, MultiStageSBIRModel
 from dataloader import SBIRDataset, sbir_collate
 from src import clip
-from utils import AverageMeter, load_config, move_to_device, save_checkpoint, set_seed
+from utils import AverageMeter, CUDAPrefetcher, load_config, move_to_device, save_checkpoint, set_seed
 
 from scripts.generate_manifest import main as generate_manifest_main
 from scripts.retrieve import main as retrieve_main
@@ -62,22 +62,42 @@ def main() -> None:
         apply_noise=False,
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config["training"]["batch_size"],
-        shuffle=True,
-        num_workers=config["training"].get("num_workers", 4),
-        pin_memory=True,
-        collate_fn=sbir_collate,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config["training"]["batch_size"],
-        shuffle=False,
-        num_workers=config["training"].get("num_workers", 4),
-        pin_memory=True,
-        collate_fn=sbir_collate,
-    )
+    training_cfg = config["training"]
+    loader_cfg = training_cfg.get("loader", {})
+    batch_size = training_cfg["batch_size"]
+    num_workers = int(training_cfg.get("num_workers", 4))
+    pin_memory = bool(loader_cfg.get("pin_memory", True))
+    persistent_workers = bool(loader_cfg.get("persistent_workers", True)) and num_workers > 0
+    prefetch_factor = loader_cfg.get("prefetch_factor")
+    if prefetch_factor is not None:
+        prefetch_factor = int(prefetch_factor)
+
+    train_loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "collate_fn": sbir_collate,
+        "persistent_workers": persistent_workers,
+    }
+    val_loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "collate_fn": sbir_collate,
+        "persistent_workers": persistent_workers,
+    }
+
+    if num_workers > 0 and prefetch_factor is not None:
+        train_loader_kwargs["prefetch_factor"] = prefetch_factor
+        val_loader_kwargs["prefetch_factor"] = prefetch_factor
+
+    train_loader = DataLoader(train_dataset, **train_loader_kwargs)
+    val_loader = DataLoader(val_dataset, **val_loader_kwargs)
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = bool(loader_cfg.get("cudnn_benchmark", True))
 
     model_cfg = config["model"]
     num_classes = train_dataset.num_virtual_classes or train_dataset.num_categories
@@ -88,6 +108,7 @@ def main() -> None:
         sketch_pretrained=model_cfg.get("sketch_pretrained", True),
         fusion_strategy=model_cfg.get("fusion_strategy", "mean"),
         num_classes=num_classes,
+        classification_cfg=model_cfg.get("classification"),
     ).to(device)
 
     if args.resume:
@@ -131,6 +152,8 @@ def main() -> None:
 
         stage_best = float("inf")
 
+        prefetch_to_gpu = bool(loader_cfg.get("prefetch_to_gpu", device.type == "cuda"))
+
         for epoch in range(epochs):
             train_dataset.update_noise(epoch=epoch, total_epochs=epochs, stage=target)
             noise_state = train_dataset.noise_parameters()
@@ -139,8 +162,26 @@ def main() -> None:
                 print(
                     f"Noise schedule | stage {target} epoch {epoch}: prob={prob:.3f} strength={strength:.3f}"
                 )
-            train_stats = run_epoch(model, train_loader, optimizer, device, loss_cfg, target, train=True)
-            val_stats = run_epoch(model, val_loader, optimizer, device, loss_cfg, target, train=False)
+            train_stats = run_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                loss_cfg,
+                target,
+                train=True,
+                prefetch_to_gpu=prefetch_to_gpu,
+            )
+            val_stats = run_epoch(
+                model,
+                val_loader,
+                optimizer,
+                device,
+                loss_cfg,
+                target,
+                train=False,
+                prefetch_to_gpu=prefetch_to_gpu,
+            )
 
             val_loss = val_stats["loss"]
             is_best = val_loss < stage_best
@@ -174,6 +215,7 @@ def run_epoch(
     loss_cfg: LossConfig,
     target: str,
     train: bool,
+    prefetch_to_gpu: bool,
 ) -> Dict[str, float]:
     model.train() if train else model.eval()
     meter = {
@@ -184,9 +226,23 @@ def run_epoch(
         "cls": AverageMeter(),
     }
 
-    for batch in tqdm(loader, desc="train" if train else "eval", leave=False):
+    loader_length = len(loader)
+    if loader_length == 0:
+        return {key: value.avg for key, value in meter.items()}
+
+    if prefetch_to_gpu and device.type == "cuda":
+        data_iter: Iterable[Dict[str, torch.Tensor]] = CUDAPrefetcher(loader, device)
+    else:
+        non_blocking = device.type == "cuda"
+
+        def generator() -> Iterable[Dict[str, torch.Tensor]]:
+            for batch in loader:
+                yield move_to_device(batch, device, non_blocking=non_blocking)
+
+        data_iter = generator()
+
+    for batch in tqdm(data_iter, total=loader_length, desc="train" if train else "eval", leave=False):
         with torch.set_grad_enabled(train):
-            batch = move_to_device(batch, device)
             outputs = model.forward_stage(batch, target, loss_cfg)
             loss = outputs["loss"]
 

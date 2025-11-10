@@ -51,6 +51,57 @@ class SketchEncoder(nn.Module):
         return self.projection(features)
 
 
+class MarginClassifier(nn.Module):
+    """Implements margin-based softmax heads (ArcFace/CosFace/linear)."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        num_classes: int,
+        mode: str = "arcface",
+        margin: float = 0.3,
+        scale: float = 30.0,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if num_classes <= 0:
+            raise ValueError("num_classes must be positive for MarginClassifier")
+        self.mode = mode.lower()
+        if self.mode not in {"arcface", "cosface", "linear"}:
+            raise ValueError(f"Unsupported margin classifier mode: {mode}")
+        self.margin = float(margin)
+        self.scale = float(scale)
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.empty(num_classes, feature_dim))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, features: torch.Tensor, labels: Optional[torch.Tensor] = None) -> torch.Tensor:
+        normalized_features = F.normalize(features, dim=-1)
+        normalized_weight = F.normalize(self.weight, dim=-1)
+        cosine = F.linear(normalized_features, normalized_weight)
+
+        if labels is None or self.mode == "linear":
+            return cosine * self.scale
+
+        labels = labels.view(-1)
+        if labels.numel() == 0:
+            return cosine * self.scale
+
+        cosine_clamped = cosine.clamp(-1.0 + self.eps, 1.0 - self.eps)
+        if self.mode == "arcface":
+            theta = torch.acos(cosine_clamped)
+            target_cosine = torch.cos(theta + self.margin)
+        elif self.mode == "cosface":
+            target_cosine = cosine_clamped - self.margin
+        else:  # fallback to linear if unknown mode slipped through
+            target_cosine = cosine_clamped
+
+        one_hot = F.one_hot(labels, num_classes=self.weight.size(0)).to(cosine.dtype)
+        logits = cosine * (1.0 - one_hot) + target_cosine * one_hot
+        logits = logits * self.scale
+        return logits
+
+
 class MultiStageSBIRModel(nn.Module):
     """Stage-wise training wrapper around CLIP and a sketch encoder."""
 
@@ -62,6 +113,7 @@ class MultiStageSBIRModel(nn.Module):
         sketch_pretrained: bool = True,
         fusion_strategy: str = "mean",
         num_classes: int = 0,
+        classification_cfg: Optional[Dict[str, object]] = None,
     ):
         super().__init__()
         self.clip = clip_model
@@ -75,9 +127,27 @@ class MultiStageSBIRModel(nn.Module):
 
         self.cls_head = None
         if num_classes > 0:
-            self.cls_head = nn.Linear(feature_dim, num_classes)
-            nn.init.normal_(self.cls_head.weight, mean=0.0, std=0.02)
-            nn.init.zeros_(self.cls_head.bias)
+            cfg = classification_cfg or {}
+            mode = str(cfg.get("mode", "arcface")).lower()
+            margin = float(cfg.get("margin", 0.3))
+            scale = float(cfg.get("scale", 30.0))
+            if mode == "linear":
+                head = nn.Linear(feature_dim, num_classes)
+                nn.init.normal_(head.weight, mean=0.0, std=0.02)
+                nn.init.zeros_(head.bias)
+                self.cls_head = head
+                self._cls_margin_mode = "linear"
+            else:
+                self.cls_head = MarginClassifier(
+                    feature_dim=feature_dim,
+                    num_classes=num_classes,
+                    mode=mode,
+                    margin=margin,
+                    scale=scale,
+                )
+                self._cls_margin_mode = mode
+        else:
+            self._cls_margin_mode = "linear"
 
     # ------------------------------------------------------------------
     # Stage control
@@ -202,8 +272,13 @@ class MultiStageSBIRModel(nn.Module):
                         cls_targets = None
                         mask_cls = None
             if cls_targets is not None and mask_cls is not None and mask_cls.any():
-                logits = self.cls_head(positives[mask_cls])
-                cls_loss = F.cross_entropy(logits, cls_targets[mask_cls])
+                feats = positives[mask_cls]
+                labels = cls_targets[mask_cls]
+                if isinstance(self.cls_head, MarginClassifier):
+                    logits = self.cls_head(feats, labels)
+                else:
+                    logits = self.cls_head(feats)
+                cls_loss = F.cross_entropy(logits, labels)
             else:
                 cls_loss = positives.new_tensor(0.0)
 

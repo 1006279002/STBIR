@@ -80,14 +80,12 @@ def compute_sketch_feature(paths: Sequence[Path], transform, model: MultiStageSB
     return feats.mean(dim=0).cpu()
 
 
-def summarize_metrics(ranks: Sequence[int], ap_all: Sequence[float], recall_ks: Sequence[int]) -> Dict[str, object]:
-    recall_keys = [f"R@{int(k)}" for k in recall_ks]
+def summarize_metrics(ranks: Sequence[int], ap_all: Sequence[float]) -> Dict[str, object]:
     summary: Dict[str, object] = {
         "num_queries": len(ranks),
         "median_rank": float("nan"),
         "map": {"mAP@all": float("nan")},
-        "accuracy": {"acc@1": float("nan"), "acc@5": float("nan")},
-        "recall_at": {key: float("nan") for key in recall_keys},
+        "accuracy": {"acc@1": float("nan"), "acc@5": float("nan"), "acc@10": float("nan")},
     }
 
     if not ranks:
@@ -102,14 +100,10 @@ def summarize_metrics(ranks: Sequence[int], ap_all: Sequence[float], recall_ks: 
     total = float(len(ranks))
     acc1 = 100.0 * sum(1 for r in ranks if r == 1) / total
     acc5 = 100.0 * sum(1 for r in ranks if r <= 5) / total
+    acc10 = 100.0 * sum(1 for r in ranks if r <= 10) / total
     summary["accuracy"]["acc@1"] = float(round(acc1, 2))
     summary["accuracy"]["acc@5"] = float(round(acc5, 2))
-
-    recall_at: Dict[str, float] = {}
-    for key, k in zip(recall_keys, recall_ks):
-        correct = sum(1 for r in ranks if r <= k)
-        recall_at[key] = float(round(100.0 * correct / total, 2))
-    summary["recall_at"] = recall_at
+    summary["accuracy"]["acc@10"] = float(round(acc10, 2))
 
     return summary
 
@@ -165,11 +159,6 @@ def main() -> None:
     ap_all: List[float] = []
     detailed: List[Dict[str, object]] = []
     category_buckets: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: {"ranks": [], "ap_all": []})
-    # recall@K settings: read from config if provided, else default to [10,20,50,100]
-    recall_ks = config.get("evaluation", {}).get("recall_at", [10, 20, 50, 100])
-    # ensure integers and sorted
-    recall_ks = sorted(int(k) for k in recall_ks)
-
     for row in tqdm(rows, desc="queries"):
         image_path = Path(row["image"]).resolve()
         text = row["text"]
@@ -198,21 +187,20 @@ def main() -> None:
             }
         )
 
-    overall_metrics = summarize_metrics(ranks, ap_all, recall_ks)
+    overall_metrics = summarize_metrics(ranks, ap_all)
     per_category_metrics: Dict[str, Dict[str, object]] = {}
     for category, bucket in category_buckets.items():
-        per_category_metrics[category] = summarize_metrics(bucket["ranks"], bucket["ap_all"], recall_ks)
+        per_category_metrics[category] = summarize_metrics(bucket["ranks"], bucket["ap_all"])
 
     median_rank = overall_metrics["median_rank"]
     mean_ap_all_pct = overall_metrics["map"]["mAP@all"]
     acc1 = overall_metrics["accuracy"]["acc@1"]
     acc5 = overall_metrics["accuracy"]["acc@5"]
-    recall_at = overall_metrics["recall_at"]
+    acc10 = overall_metrics["accuracy"].get("acc@10", float("nan"))
 
     output = {
         "median_rank": median_rank,
         "num_queries": overall_metrics["num_queries"],
-        "recall_at": recall_at,
         "map": overall_metrics["map"],
         "accuracy": overall_metrics["accuracy"],
         "per_category": per_category_metrics,
@@ -237,45 +225,60 @@ def main() -> None:
         print("acc@5: nan")
     else:
         print(f"acc@5: {acc5:.2f}%")
-    # print recall@K
-    for k in recall_ks:
-        key = f"R@{k}"
-        val = recall_at.get(key)
-        if val is None or (isinstance(val, float) and (val != val)):
-            print(f"{key}: nan")
-        else:
-            # val is stored as percentage already
-            print(f"{key}: {val:.2f}%")
+    if math.isnan(acc10):
+        print("acc@10: nan")
+    else:
+        print(f"acc@10: {acc10:.2f}%")
 
     if per_category_metrics:
         print("Per-category metrics:")
+        header = ["Category", "Count", "Median Rank", "mAP@all", "acc@1", "acc@5", "acc@10"]
+        rows: List[List[str]] = []
         for category in sorted(per_category_metrics):
             metrics = per_category_metrics[category]
             cat_median = metrics["median_rank"]
             cat_map = metrics["map"].get("mAP@all", float("nan"))
             cat_acc1 = metrics["accuracy"].get("acc@1", float("nan"))
             cat_acc5 = metrics["accuracy"].get("acc@5", float("nan"))
-            cat_recall = metrics["recall_at"]
+            cat_acc10 = metrics["accuracy"].get("acc@10", float("nan"))
 
-            cat_median_str = "nan" if math.isnan(cat_median) else f"{cat_median:.2f}"
-            cat_map_str = "nan" if math.isnan(cat_map) else f"{cat_map:.2f}%"
-            cat_acc1_str = "nan" if math.isnan(cat_acc1) else f"{cat_acc1:.2f}%"
-            cat_acc5_str = "nan" if math.isnan(cat_acc5) else f"{cat_acc5:.2f}%"
-
-            recall_parts: List[str] = []
-            for k in recall_ks:
-                key = f"R@{k}"
-                val = cat_recall.get(key, float("nan"))
-                if isinstance(val, float) and math.isnan(val):
-                    recall_parts.append(f"{key}=nan")
-                else:
-                    recall_parts.append(f"{key}={val:.2f}%")
-            recall_str = ", ".join(recall_parts)
-
-            print(
-                f"  {category} (n={metrics['num_queries']}): median_rank={cat_median_str}, "
-                f"mAP@all={cat_map_str}, acc@1={cat_acc1_str}, acc@5={cat_acc5_str}, {recall_str}"
+            rows.append(
+                [
+                    category,
+                    str(metrics["num_queries"]),
+                    "nan" if math.isnan(cat_median) else f"{cat_median:.2f}",
+                    "nan" if math.isnan(cat_map) else f"{cat_map:.2f}%",
+                    "nan" if math.isnan(cat_acc1) else f"{cat_acc1:.2f}%",
+                    "nan" if math.isnan(cat_acc5) else f"{cat_acc5:.2f}%",
+                    "nan" if math.isnan(cat_acc10) else f"{cat_acc10:.2f}%",
+                ]
             )
+
+        column_widths = [len(col) for col in header]
+        if rows:
+            column_widths = [max(len(header[i]), max(len(row[i]) for row in rows)) for i in range(len(header))]
+        header_line = " | ".join(header[i].ljust(column_widths[i]) for i in range(len(header)))
+        separator = "-+-".join("-" * column_widths[i] for i in range(len(header)))
+        print(header_line)
+        print(separator)
+        for row in rows:
+            print(" | ".join(row[i].ljust(column_widths[i]) for i in range(len(header))))
+
+    table_header = ["Metric", "Value"]
+    table_rows = [
+        ["Median Rank", "nan" if math.isnan(median_rank) else f"{median_rank:.2f}"],
+        ["mAP@all", "nan" if math.isnan(mean_ap_all_pct) else f"{mean_ap_all_pct:.2f}%"],
+        ["acc@1", "nan" if math.isnan(acc1) else f"{acc1:.2f}%"],
+        ["acc@5", "nan" if math.isnan(acc5) else f"{acc5:.2f}%"],
+        ["acc@10", "nan" if math.isnan(acc10) else f"{acc10:.2f}%"],
+        ["#Queries", str(overall_metrics["num_queries"])]
+    ]
+    col_widths = [max(len(table_header[i]), max(len(row[i]) for row in table_rows)) for i in range(2)]
+    print("\nOverall metrics:")
+    print(" | ".join(table_header[i].ljust(col_widths[i]) for i in range(2)))
+    print("-+-".join("-" * col_widths[i] for i in range(2)))
+    for row in table_rows:
+        print(" | ".join(row[i].ljust(col_widths[i]) for i in range(2)))
 
     print(f"Saved sample retrieval details to {output_path}")
 

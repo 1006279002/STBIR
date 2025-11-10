@@ -1,4 +1,4 @@
-seed: 112
+seed: 113
 
 data:
   val_ratio: 0.1
@@ -71,11 +71,21 @@ model:
   sketch_pretrained: true
   feature_dim: 512
   fusion_strategy: mean
+  classification:
+    mode: arcface
+    margin: 0.2
+    scale: 32.0
 
 training:
-  batch_size: 10
+  batch_size: 16
   num_workers: 4
   device: cuda
+  loader:
+    persistent_workers: true
+    prefetch_factor: 4
+    pin_memory: true
+    prefetch_to_gpu: true
+    cudnn_benchmark: true
   gradient_clip: 1.0
   checkpoint:
     dir: checkpoints
@@ -84,18 +94,18 @@ training:
   stages:
     - name: sketch_alignment
       target: sketch
-      epochs: 10
-      lr: 4.0e-5
+      epochs: 8
+      lr: 5.0e-5
       weight_decay: 1.0e-4
     - name: image_alignment
       target: image
-      epochs: 30
+      epochs: 12
       lr: 5.0e-5
       weight_decay: 1.0e-4
     - name: text_alignment
       target: text
-      epochs: 12
-      lr: 6.0e-5
+      epochs: 8
+      lr: 5.0e-5
       weight_decay: 1.0e-4
 
 loss:
@@ -106,7 +116,7 @@ loss:
     info_nce: 0.8
     triplet: 0.7
     fusion: 0.2
-    cls: 0.3
+    cls: 0.2
 
 retrieval:
   top_k: 10
