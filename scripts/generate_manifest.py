@@ -213,13 +213,14 @@ def assign_negatives(
     return records
 
 
-def generate_manifests(config: Dict[str, object], seed: int) -> None:
-    random.seed(seed)
-
+def generate_manifests(config: Dict[str, object]) -> None:
     data_cfg = config["data"]
     datasets_cfg = data_cfg["datasets"]
+    seed = int(config.get("seed", 110))
     val_ratio = float(data_cfg.get("val_ratio", 0.0))
     neg_cfg = data_cfg.get("negatives_per_modality", {})
+
+    random.seed(seed)
 
     train_samples: List[RawSample] = []
     val_samples: List[RawSample] = []
@@ -383,7 +384,6 @@ def write_manifest(path: Path, records: Sequence[Dict[str, object]]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate SBIR manifest files with positive/negative tuples.")
     parser.add_argument("--config", default="config.yaml", help="Path to project configuration YAML file.")
-    parser.add_argument("--seed", type=int, default=110, help="Random seed used during sampling.")
     return parser.parse_args()
 
 
@@ -391,7 +391,8 @@ def main() -> None:
     args = parse_args()
     with open(args.config, "r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
-    generate_manifests(config, args.seed)
+
+    generate_manifests(config)
 
 
 if __name__ == "__main__":

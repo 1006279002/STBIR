@@ -1,4 +1,4 @@
-seed: 113
+seed: 114
 
 data:
   val_ratio: 0.1
@@ -84,7 +84,6 @@ training:
     persistent_workers: true
     prefetch_factor: 4
     pin_memory: true
-    prefetch_to_gpu: true
     cudnn_benchmark: true
   gradient_clip: 1.0
   checkpoint:
