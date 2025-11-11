@@ -120,10 +120,8 @@ def main() -> None:
     loss_cfg = LossConfig(
         temperature=float(loss_cfg_raw["temperature"]),
         triplet_margin=float(loss_cfg_raw["triplet_margin"]),
-        fusion_margin=float(loss_cfg_raw["fusion_margin"]),
         weight_info_nce=float(weight_cfg["info_nce"]),
         weight_triplet=float(weight_cfg["triplet"]),
-        weight_fusion=float(weight_cfg["fusion"]),
         weight_cls=float(weight_cfg.get("cls", 0.0)),
     )
 
@@ -222,7 +220,6 @@ def run_epoch(
         "loss": AverageMeter(),
         "info_nce": AverageMeter(),
         "triplet": AverageMeter(),
-        "fusion": AverageMeter(),
         "cls": AverageMeter(),
     }
 
@@ -263,7 +260,6 @@ def run_epoch(
         meter["loss"].update(loss.item(), batch_size)
         meter["info_nce"].update(outputs["info_nce"].item(), batch_size)
         meter["triplet"].update(outputs["triplet"].item(), batch_size)
-        meter["fusion"].update(outputs["fusion"].item(), batch_size)
         cls_value = outputs.get("cls")
         if cls_value is None:
             cls_item = 0.0

@@ -9,11 +9,6 @@ from torch import nn
 from torchvision import models
 from torchvision.models import ResNet50_Weights
 
-
-CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073])
-CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711])
-
-
 def l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-8) -> torch.Tensor:
     denom = torch.clamp(torch.norm(x, dim=dim, keepdim=True), min=eps)
     return x / denom
@@ -23,10 +18,8 @@ def l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-8) -> torch.Ten
 class LossConfig:
     temperature: float
     triplet_margin: float
-    fusion_margin: float
     weight_info_nce: float
     weight_triplet: float
-    weight_fusion: float
     weight_cls: float
 
 
@@ -121,9 +114,6 @@ class MultiStageSBIRModel(nn.Module):
         self.sketch_encoder = SketchEncoder(sketch_backbone, output_dim=feature_dim, pretrained=sketch_pretrained)
         self.fusion_strategy = fusion_strategy
         self.num_classes = num_classes
-
-        self.register_buffer("clip_mean", CLIP_MEAN.view(1, 3, 1, 1))
-        self.register_buffer("clip_std", CLIP_STD.view(1, 3, 1, 1))
 
         self.cls_head = None
         if num_classes > 0:
@@ -230,25 +220,16 @@ class MultiStageSBIRModel(nn.Module):
             positives = sketch_features
             negatives = neg_sketches
             mask = neg_sketch_mask
-            fusion_loss = images.new_tensor(0.0)
         elif target == "image":
             anchor = self._fuse_features([text_features, sketch_features])
             positives = image_features
             negatives = neg_images
             mask = neg_image_mask
-            fusion_loss = self._fusion_alignment_loss(
-                images,
-                batch["sketches_clip"],
-                batch["neg_sketches_clip"],
-                image_features,
-                loss_cfg.fusion_margin,
-            )
         elif target == "text":
             anchor = self._fuse_features([image_features, sketch_features])
             positives = text_features
             negatives = neg_texts
             mask = neg_text_mask
-            fusion_loss = images.new_tensor(0.0)
         else:
             raise ValueError(f"Unknown target stage: {target}")
 
@@ -285,7 +266,6 @@ class MultiStageSBIRModel(nn.Module):
         total = (
             loss_cfg.weight_info_nce * info
             + loss_cfg.weight_triplet * triplet
-            + loss_cfg.weight_fusion * fusion_loss
             + loss_cfg.weight_cls * cls_loss
         )
 
@@ -293,7 +273,6 @@ class MultiStageSBIRModel(nn.Module):
             "loss": total,
             "info_nce": info,
             "triplet": triplet,
-            "fusion": fusion_loss,
             "cls": cls_loss,
             "features": {
                 "image": image_features,
@@ -403,27 +382,6 @@ class MultiStageSBIRModel(nn.Module):
             return anchor.new_tensor(0.0)
         return total / count
 
-    def _fusion_alignment_loss(
-        self,
-        images: torch.Tensor,
-        sketches_clip: torch.Tensor,
-        neg_sketches_clip: torch.Tensor,
-        image_features: torch.Tensor,
-        margin: float,
-    ) -> torch.Tensor:
-        fused = self._fuse_quad(images, sketches_clip)
-        fused_features = self.encode_images(fused)
-        pos_loss = 1.0 - F.cosine_similarity(fused_features, image_features).mean()
-
-        neg_loss = images.new_tensor(0.0)
-        if neg_sketches_clip.size(1) > 0:
-            neg_first = neg_sketches_clip[:, 0]
-            fused_neg = self._fuse_quad(images, neg_first)
-            fused_neg_features = self.encode_images(fused_neg)
-            neg_sim = F.cosine_similarity(fused_neg_features, image_features)
-            neg_loss = torch.clamp(neg_sim - margin, min=0.0).mean()
-        return pos_loss + neg_loss
-
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
@@ -436,22 +394,6 @@ class MultiStageSBIRModel(nn.Module):
         else:
             raise ValueError(f"Unsupported fusion strategy: {self.fusion_strategy}")
         return l2_normalize(fused)
-
-    def _fuse_quad(self, image: torch.Tensor, sketch: torch.Tensor) -> torch.Tensor:
-        image_denorm = self._denormalize_clip(image)
-        sketch_denorm = self._denormalize_clip(sketch)
-        fused = image_denorm.clone()
-        h, w = fused.shape[-2:]
-        h2, w2 = h // 2, w // 2
-        fused[..., :h2, w2:] = sketch_denorm[..., :h2, w2:]
-        fused[..., h2:, :w2] = sketch_denorm[..., h2:, :w2]
-        return self._normalize_clip(fused)
-
-    def _denormalize_clip(self, tensor: torch.Tensor) -> torch.Tensor:
-        return tensor * self.clip_std.to(tensor.device, tensor.dtype) + self.clip_mean.to(tensor.device, tensor.dtype)
-
-    def _normalize_clip(self, tensor: torch.Tensor) -> torch.Tensor:
-        return (tensor - self.clip_mean.to(tensor.device, tensor.dtype)) / self.clip_std.to(tensor.device, tensor.dtype)
 
 
 __all__ = ["MultiStageSBIRModel", "LossConfig"]

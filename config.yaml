@@ -111,11 +111,9 @@ training:
 loss:
   temperature: 0.07
   triplet_margin: 0.2
-  fusion_margin: 0.1
   weights:
     info_nce: 0.8
     triplet: 0.7
-    fusion: 0.2
     cls: 0.2
 
 retrieval:
