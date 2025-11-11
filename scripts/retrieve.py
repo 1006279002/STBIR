@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -173,6 +174,9 @@ def main() -> None:
         target_idx = image_index[image_path]
         rank = (sorted_idx == target_idx).nonzero(as_tuple=False).item() + 1
 
+        top_indices = sorted_idx[:10].tolist()
+        top_candidates = [unique_images[idx].name for idx in top_indices]
+
         ranks.append(rank)
         ap_all.append(1.0 / rank)
         category = row.get("category", "unknown")
@@ -184,6 +188,7 @@ def main() -> None:
                 "image": str(image_path),
                 "text": text,
                 "rank": int(rank),
+                "top10_images": top_candidates,
             }
         )
 
@@ -204,31 +209,36 @@ def main() -> None:
         "map": overall_metrics["map"],
         "accuracy": overall_metrics["accuracy"],
         "per_category": per_category_metrics,
-        "details": detailed[: min(50, len(detailed))],
+        "details": detailed,
     }
+
+    run_record = dict(output)
+    run_record["timestamp"] = datetime.now().isoformat(timespec="seconds")
+    run_record["config"] = str(args.config)
+    run_record["checkpoint"] = str(args.checkpoint)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as handle:
-        json.dump(output, handle, ensure_ascii=False, indent=2)
 
-    print(f"Median rank: {median_rank:.2f} over {overall_metrics['num_queries']} queries")
-    if math.isnan(mean_ap_all_pct):
-        print("mAP@all: nan")
-    else:
-        print(f"mAP@all: {mean_ap_all_pct:.2f}%")
-    if math.isnan(acc1):
-        print("acc@1: nan")
-    else:
-        print(f"acc@1: {acc1:.2f}%")
-    if math.isnan(acc5):
-        print("acc@5: nan")
-    else:
-        print(f"acc@5: {acc5:.2f}%")
-    if math.isnan(acc10):
-        print("acc@10: nan")
-    else:
-        print(f"acc@10: {acc10:.2f}%")
+    past_runs: List[Dict[str, object]] = []
+    if output_path.exists():
+        try:
+            with output_path.open("r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+        except json.JSONDecodeError:
+            existing = None
+        if isinstance(existing, list):
+            past_runs = existing
+        elif isinstance(existing, dict):
+            if "history" in existing and isinstance(existing["history"], list):
+                past_runs = list(existing["history"])
+            else:
+                past_runs = [existing]
+
+    past_runs.append(run_record)
+
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(past_runs, handle, ensure_ascii=False, indent=2)
 
     if per_category_metrics:
         print("Per-category metrics:")
