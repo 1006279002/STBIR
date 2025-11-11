@@ -1,4 +1,4 @@
-# SBIR_demo
+# STBIR_demo
 
 本项目实现了一个以 CLIP 为基础、支持“文本 + 素描 → 图像”检索的三模态框架。“分阶段对齐 + 多任务度量学习”范式：
 
@@ -13,12 +13,15 @@
 - **统一语义空间**：`cstbir_model.MultiStageSBIRModel` 将三种模态特征 `l2` 归一化后映射到同一球面，用余弦距离衡量跨模态相似度。
 - **阶段式对齐**：`configure_stage` 仅解冻目标模态参数（素描/图像/文本），其余模态作为冻结锚点提供监督，缓解多模态同步更新时的梯度冲突。
 - **多任务损失组合**：
-        - InfoNCE 对比损失（以融合特征为 anchor）；
-        - 余弦三元组损失（设定 margin 防止正负样本塌缩）；
-        - 图像-素描融合一致性损失（`_fuse_quad` 拼接象限图像，引导视觉分支聚焦素描指示区域）；
-        - ArcFace 分类头（可利用真实类别或虚拟聚类标签增强判别力）。
+1. InfoNCE 对比损失（以融合特征为 anchor）；
+2. 余弦三元组损失（设定 margin 防止正负样本塌缩）；
+3. 图像-素描融合一致性损失（`_fuse_quad` 拼接象限图像，引导视觉分支聚焦素描指示区域）；
+4. ArcFace 分类头（可利用真实类别或虚拟聚类标签增强判别力）。
 - **课程噪声增强**：`dataloader.CurriculumNoiseSchedule` 会随 epoch 自动调节图像/素描噪声概率与强度，模拟素描粗糙度与拍摄退化。
 - **可控负样本池**：`scripts/generate_manifest.py` 会为每条样本分配跨模态负例，训练时 `SBIRDataset` 固定采样数量确保 batch 内含 Hard Negatives 样本。
+
+## 数据集
+采用QUML-shoe-chair-V2数据集进行实验
 
 ## 环境配置
 - Python >= 3.8.16（推荐 Conda）
@@ -38,10 +41,11 @@ conda env update --file environment.yaml --prune
          ```bash
          python -m scripts.generate_manifest --config config.yaml --seed 110
          ```
-         该脚本会：
-         - 为训练/验证/测试划分聚合正样本（图像、文本、素描）；
-         - 在同类别或同虚拟类簇内优先抽取负样本，数量由 `negatives_per_modality` 控制；
-         - 写入 `manifests/train|val|test_manifest.jsonl`，供数据加载器直接读取。
+         
+该脚本会：         
+- 为训练/验证/测试划分聚合正样本（图像、文本、素描）；
+- 在同类别或同虚拟类簇内优先抽取负样本，数量由 `negatives_per_modality` 控制；
+- 写入 `manifests/train|val|test_manifest.jsonl`，供数据加载器直接读取。
 3. **Manifest 字段说明**：单行 JSON 示例
          ```json
          {
@@ -96,10 +100,3 @@ python -m scripts.retrieve --config config.yaml --checkpoint checkpoints/best.pt
 - `scripts/retrieve.py`：检索评估脚本。
 - `utils.py`：通用工具（配置读取、CUDA 预取、平均计数器等）。
 
-**关键表示与公式**
-
-- 归一化特征：$\hat{s} = \mathrm{normalize}(f_s)$，$\hat{i} = \mathrm{normalize}(f_i)$，$\hat{t} = \mathrm{normalize}(f_t)$。
-- 阶段锚点：$a_s = \mathrm{normalize}(\hat{i} + \hat{t})$，$a_i = \mathrm{normalize}(\hat{t} + \hat{s})$，$a_t = \mathrm{normalize}(\hat{i} + \hat{s})$。
-- InfoNCE：$\mathcal{L}_{\text{InfoNCE}} = - \log \dfrac{\exp(a \cdot p / \tau)}{\exp(a \cdot p / \tau) + \sum_j \exp(a \cdot n_j / \tau)}$。
-- 余弦三元组：$\mathcal{L}_{\text{Triplet}} = \max(0, m + a \cdot n_j - a \cdot p)$。
-- ArcFace 分类：$\mathcal{L}_{\text{ArcFace}} = - \log \dfrac{e^{s(\cos(\theta_y + m))}}{e^{s(\cos(\theta_y + m))} + \sum_{k \neq y} e^{s \cos \theta_k}}$。
