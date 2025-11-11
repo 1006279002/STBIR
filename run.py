@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, Iterable
+from typing import Dict
 
 import torch
 from torch.utils.data import DataLoader
@@ -13,7 +13,7 @@ from tqdm import tqdm
 from cstbir_model import LossConfig, MultiStageSBIRModel
 from dataloader import SBIRDataset, sbir_collate
 from src import clip
-from utils import AverageMeter, CUDAPrefetcher, load_config, move_to_device, save_checkpoint, set_seed
+from utils import AverageMeter, load_config, move_to_device, save_checkpoint, set_seed
 
 from scripts.generate_manifest import main as generate_manifest_main
 from scripts.retrieve import main as retrieve_main
@@ -150,8 +150,6 @@ def main() -> None:
 
         stage_best = float("inf")
 
-        prefetch_to_gpu = bool(loader_cfg.get("prefetch_to_gpu", device.type == "cuda"))
-
         for epoch in range(epochs):
             train_dataset.update_noise(epoch=epoch, total_epochs=epochs, stage=target)
             noise_state = train_dataset.noise_parameters()
@@ -168,7 +166,6 @@ def main() -> None:
                 loss_cfg,
                 target,
                 train=True,
-                prefetch_to_gpu=prefetch_to_gpu,
             )
             val_stats = run_epoch(
                 model,
@@ -178,7 +175,6 @@ def main() -> None:
                 loss_cfg,
                 target,
                 train=False,
-                prefetch_to_gpu=prefetch_to_gpu,
             )
 
             val_loss = val_stats["loss"]
@@ -213,7 +209,6 @@ def run_epoch(
     loss_cfg: LossConfig,
     target: str,
     train: bool,
-    prefetch_to_gpu: bool,
 ) -> Dict[str, float]:
     model.train() if train else model.eval()
     meter = {
@@ -227,18 +222,10 @@ def run_epoch(
     if loader_length == 0:
         return {key: value.avg for key, value in meter.items()}
 
-    if prefetch_to_gpu and device.type == "cuda":
-        data_iter: Iterable[Dict[str, torch.Tensor]] = CUDAPrefetcher(loader, device)
-    else:
-        non_blocking = device.type == "cuda"
+    non_blocking = device.type == "cuda"
 
-        def generator() -> Iterable[Dict[str, torch.Tensor]]:
-            for batch in loader:
-                yield move_to_device(batch, device, non_blocking=non_blocking)
-
-        data_iter = generator()
-
-    for batch in tqdm(data_iter, total=loader_length, desc="train" if train else "eval", leave=False):
+    for batch in tqdm(loader, total=loader_length, desc="train" if train else "eval", leave=False):
+        batch = move_to_device(batch, device, non_blocking=non_blocking)
         with torch.set_grad_enabled(train):
             outputs = model.forward_stage(batch, target, loss_cfg)
             loss = outputs["loss"]
@@ -271,6 +258,7 @@ def run_epoch(
 
 
 if __name__ == "__main__":
+    generate_manifest_main()
     main()
     retrieve_main()
 
